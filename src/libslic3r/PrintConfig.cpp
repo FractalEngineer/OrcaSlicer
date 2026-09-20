@@ -6503,6 +6503,12 @@ void PrintConfigDef::init_fff_params()
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("spiral_mode_allow_islands", coBool);
+    def->label = L("Allow islands");
+    def->tooltip = L("Allows disconnected contours in Spiral Vase mode. The primary contour remains continuously spiralized while additional islands are printed as single-wall loops at the current layer height. Additional islands may contain seams, travel moves, and retractions.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("spiral_mode_smooth", coBool);
     def->label = L("Smooth Spiral");
     def->tooltip = L("Smooth Spiral smooths out X and Y moves as well, "

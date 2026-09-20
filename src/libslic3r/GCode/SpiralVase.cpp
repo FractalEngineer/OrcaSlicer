@@ -2,7 +2,9 @@
 #include "GCode.hpp"
 #include <sstream>
 #include <cmath>
+#include <cstdio>
 #include <limits>
+#include <locale>
 
 namespace Slic3r {
 
@@ -64,6 +66,14 @@ SpiralVase::SpiralPoint nearest_point_on_lines(SpiralVase::SpiralPoint          
 } // namespace SpiralVase
 
 std::string SpiralVase::process_layer(const std::string &gcode, bool last_layer)
+{
+    // Keep the established single-loop processing byte-for-byte unchanged unless
+    // disconnected contours were explicitly requested.
+    return m_config.spiral_mode_allow_islands ? process_layer_allow_islands(gcode, last_layer)
+                                              : process_layer_legacy(gcode, last_layer);
+}
+
+std::string SpiralVase::process_layer_legacy(const std::string &gcode, bool last_layer)
 {
     /*  This post-processor relies on several assumptions:
         - all layers are processed through it, including those that are not supposed
@@ -213,6 +223,190 @@ std::string SpiralVase::process_layer(const std::string &gcode, bool last_layer)
     m_previous_layer = current_layer;
     
     return new_gcode + transition_gcode;
+}
+
+std::string SpiralVase::process_layer_allow_islands(const std::string &gcode, bool last_layer)
+{
+    float bottom_z = 0.f;
+    float top_z = 0.f;
+    float total_length = 0.f;
+    size_t begin_count = 0;
+    size_t end_count = 0;
+    bool inside = false;
+    bool started = false;
+    bool valid = true;
+    bool prefix_travel = false;
+    SpiralPoint start(0.f, 0.f);
+    SpiralPoint end(0.f, 0.f);
+    std::string unmarked;
+
+    // Scope is supplied by the loop emitter. Never infer identity from travel,
+    // role comments, flow changes, or the size/order of raw extrusion runs.
+    GCodeReader scan = m_reader;
+    scan.parse_buffer(gcode, [&](GCodeReader &reader, const GCodeReader::GCodeLine &line) {
+        if (line.raw().compare(0, strlen(primary_begin), primary_begin) == 0) {
+            ++begin_count;
+            inside = true;
+            std::istringstream heights(line.raw().substr(strlen(primary_begin)));
+            heights.imbue(std::locale::classic());
+            valid &= bool(heights >> bottom_z >> top_z);
+            return;
+        }
+        if (line.raw() == primary_end) {
+            ++end_count;
+            valid &= inside && started;
+            inside = false;
+            return;
+        }
+        unmarked += line.raw() + '\n';
+        if (line.cmd_is("G1") || line.cmd_is("G0")) {
+            const float distance = line.dist_XY(reader);
+            if (inside && line.extruding(reader) && distance > 0.f) {
+                if (!started) {
+                    start = SpiralPoint(reader.x(), reader.y());
+                    started = true;
+                }
+                total_length += distance;
+                end = SpiralPoint(line.new_X(reader), line.new_Y(reader));
+            } else if (!started) {
+                prefix_travel |= distance > float(EPSILON);
+            } else if (inside) {
+                // A disconnected or retracted path cannot be a continuous helix.
+                // Leave such a layer conventional instead of dropping any motion.
+                valid &= distance <= float(EPSILON) && !line.retracting(reader) && !line.has_z();
+            }
+        }
+    });
+
+    valid &= begin_count == 1 && end_count == 1 && !inside && started &&
+             total_length > float(EPSILON) && top_z > bottom_z &&
+             SpiralVaseHelpers::distance(start, end) < 0.003f;
+    if (!m_enabled || !valid) {
+        m_reader = std::move(scan);
+        delete m_previous_layer;
+        m_previous_layer = nullptr;
+        // In particular, never feed a multi-contour layer to the legacy path:
+        // its deliberate travel suppression would join unrelated extrusions.
+        return begin_count == 0 && end_count == 0 ? gcode : unmarked;
+    }
+
+    const bool relative_e = m_config.use_relative_e_distances.value;
+    const bool transition_in = m_transition_layer || m_previous_layer == nullptr;
+    const bool transition_out = last_layer;
+    const bool continuous = !prefix_travel && std::abs(m_reader.z() - bottom_z) < 0.001f;
+    const float min_segment_length = std::max(float(EPSILON), 2 * float(m_config.resolution.value));
+    float length = 0.f;
+    float e_offset = 0.f;
+    float finishing_e = 0.f;
+    std::vector<SpiralPoint> current_layer{start};
+    SpiralPoint last_point = start;
+    std::string output;
+    std::string finishing;
+    inside = false;
+    started = false;
+
+    m_reader.parse_buffer(gcode, [&](GCodeReader &reader, GCodeReader::GCodeLine line) {
+        if (line.raw().compare(0, strlen(primary_begin), primary_begin) == 0) {
+            inside = true;
+            return;
+        }
+        if (line.raw() == primary_end) {
+            if (transition_out) {
+                if (!relative_e)
+                    output += "G92 E0\n";
+                output += finishing;
+            }
+            // Restore the writer's absolute E coordinate after changing flow or
+            // replaying the finishing loop, so islands and later layers match it.
+            if (!relative_e && (e_offset != 0.f || transition_out)) {
+                char reset[64];
+                snprintf(reset, sizeof(reset), "G92 E%.5f\n", reader.e());
+                output += reset;
+            }
+            inside = false;
+            return;
+        }
+        if (inside && line.cmd_is("G1") && line.extruding(reader) && line.dist_XY(reader) > 0.f) {
+            if (!started) {
+                // Travel/retraction/lift commands have already positioned the
+                // nozzle over the primary. Descend there, never over an island.
+                if (!continuous) {
+                    char move[64];
+                    snprintf(move, sizeof(move), "G1 Z%.3f\n", bottom_z);
+                    output += move;
+                }
+                started = true;
+            }
+            const float distance = line.dist_XY(reader);
+            const float original_e = line.dist_E(reader);
+            length += distance;
+            const float factor = std::min(1.f, length / total_length);
+            float extrusion = original_e;
+            const SpiralPoint point(line.new_X(reader), line.new_Y(reader));
+            current_layer.push_back(point);
+
+            if (transition_out) {
+                GCodeReader::GCodeLine finish(line);
+                const float flow = float(m_config.spiral_finishing_flow_ratio.value);
+                const float delta = original_e * (flow + (1.f - factor) * (1.f - flow));
+                finishing_e += delta;
+                finish.set(E, relative_e ? delta : finishing_e, 5);
+                finish.set(Z, top_z);
+                std::string move = finish.raw();
+                if (!finish.has_f()) {
+                    // Keep F after the coordinates: cooling's duplicate-feedrate
+                    // removal can strip G1 from a line beginning with G1 F.
+                    const size_t comment = move.find(';');
+                    move.insert(comment == std::string::npos ? move.size() : comment,
+                                " F" + std::to_string(line.new_F(reader)) + " ");
+                }
+                finishing += move + '\n';
+            }
+            if (transition_in) {
+                const float flow = float(m_config.spiral_starting_flow_ratio.value);
+                extrusion *= flow + factor * (1.f - flow);
+            }
+            if (m_smooth_spiral && m_previous_layer != nullptr) {
+                bool found = false;
+                float distance_to_previous = 0.f;
+                const SpiralPoint nearest = SpiralVaseHelpers::nearest_point_on_lines(
+                    point, m_previous_layer, found, distance_to_previous);
+                if (found && distance_to_previous < m_max_xy_smoothing) {
+                    const SpiralPoint target = SpiralVaseHelpers::add(
+                        SpiralVaseHelpers::scale(nearest, 1.f - factor), SpiralVaseHelpers::scale(point, factor));
+                    const float modified_distance = SpiralVaseHelpers::distance(last_point, target);
+                    // Keep tiny segments instead of deleting material or the
+                    // endpoint that brings the helix to the completed layer Z.
+                    if (modified_distance >= min_segment_length) {
+                        line.set(X, target.x);
+                        line.set(Y, target.y);
+                        extrusion *= modified_distance / distance;
+                    }
+                }
+            }
+            last_point = SpiralPoint(line.new_X(reader), line.new_Y(reader));
+            line.set(Z, bottom_z + factor * (top_z - bottom_z));
+            e_offset += extrusion - original_e;
+            line.set(E, relative_e ? extrusion : line.e() + e_offset, 5);
+        } else if (!started && continuous && line.cmd_is("G1") && line.has_z() &&
+                   std::abs(line.z() - top_z) < 0.001f) {
+            // A single aligned vase needs no up/down motion at the layer seam.
+            line.set(Z, bottom_z);
+        } else if (inside && !relative_e && line.has_e()) {
+            if (line.cmd_is("G92"))
+                e_offset = 0.f;
+            else
+                line.set(E, line.e() + e_offset, 5);
+        }
+        if (inside && started && transition_out && !line.cmd_is("G1") &&
+            !line.cmd_is("G0") && !line.cmd_is("G92"))
+            finishing += line.raw() + '\n';
+        output += line.raw() + '\n';
+    });
+
+    delete m_previous_layer;
+    m_previous_layer = new std::vector<SpiralPoint>(std::move(current_layer));
+    return output;
 }
 
 }

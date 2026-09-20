@@ -1543,7 +1543,8 @@ void PerimeterGenerator::process_classic()
                             }
                         }
                     }
-                    if (m_spiral_vase && (offsets.size() > 1 || offsets_with_smaller_width.size() > 1)) {
+                    if (m_spiral_vase && !this->print_config->spiral_mode_allow_islands &&
+                        (offsets.size() > 1 || offsets_with_smaller_width.size() > 1)) {
                         // Remove all but the largest area polygon.
                         keep_largest_contour_only(offsets);
                         //BBS

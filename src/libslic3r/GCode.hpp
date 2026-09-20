@@ -666,6 +666,10 @@ private:
     FarthestPointTimelapseContext m_farthest_point_timelapse;
 
     bool                                m_enable_loop_clipping;
+    // Selected from complete emitted loops, never inferred from G-code runs.
+    const ExtrusionLoop*                m_spiral_vase_primary_loop = nullptr;
+    Polygon                             m_spiral_vase_primary_polygon;
+    Point                               m_spiral_vase_primary_point;
     //resonance avoidance
     bool                                m_resonance_avoidance; 
     // If enabled, the G-code generator will put following comments at the ends

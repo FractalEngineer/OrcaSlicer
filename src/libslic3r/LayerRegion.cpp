@@ -139,7 +139,8 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         g.lower_slices = &lower_slices;
     }
 
-    if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode)
+    if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne &&
+        (!spiral_mode || print_config.spiral_mode_allow_islands))
         g.process_arachne();
     else
         g.process_classic();

@@ -196,7 +196,13 @@ static std::vector<VolumeSlices> slice_volumes_inner(
                     if (model_volume->is_model_part() && print_config.spiral_mode) {
                         auto it = std::find_if(layer_range.volume_regions.begin(), layer_range.volume_regions.end(),
                             [model_volume](const auto &slice){ return model_volume == slice.model_volume; });
-                        params.mode = MeshSlicingParams::SlicingMode::PositiveLargestContour;
+                        // Spiral Vase normally removes every contour except the largest one
+                        // while slicing. When islands are requested, preserve the profile's
+                        // normal contour semantics as well: an inner shell may become a hole
+                        // while the model transitions, and closing it would discard that wall.
+                        params.mode = print_config.spiral_mode_allow_islands
+                            ? params_base.mode
+                            : MeshSlicingParams::SlicingMode::PositiveLargestContour;
                         // Slice the bottom layers with SlicingMode::Regular.
                         // This needs to be in sync with LayerRegion::make_perimeters() spiral_mode!
                         const PrintRegionConfig &region_config = it->region->config();

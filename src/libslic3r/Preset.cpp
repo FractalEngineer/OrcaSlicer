@@ -1042,6 +1042,7 @@ static std::vector<std::string> s_Preset_print_options{
     "alternate_extra_wall",
     "slice_closing_radius",
     "spiral_mode",
+    "spiral_mode_allow_islands",
     "spiral_mode_smooth",
     "spiral_mode_max_xy_smoothing",
     "spiral_starting_flow_ratio",

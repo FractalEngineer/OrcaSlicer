@@ -5548,21 +5548,26 @@ LayerResult GCode::process_layer(
     // Check whether it is possible to apply the spiral vase logic for this layer.
     // Just a reminder: A spiral vase mode is allowed for a single object, single material print only.
     m_enable_loop_clipping = true;
+    m_spiral_vase_primary_loop = nullptr;
     if (m_spiral_vase && layers.size() == 1 && support_layer == nullptr) {
         bool enable = (layer.id() > 0 || !print.has_brim()) && (layer.id() >= (size_t)print.config().skirt_height.value && ! print.has_infinite_skirt());
         if (enable) {
             for (const LayerRegion *layer_region : layer.regions())
                 if (size_t(layer_region->region().config().bottom_shell_layers.value) > layer.id() ||
-                    layer_region->perimeters.items_count() > 1u ||
+                    (!m_config.spiral_mode_allow_islands && layer_region->perimeters.items_count() > 1u) ||
                     layer_region->fills.items_count() > 0) {
                     enable = false;
                     break;
                 }
         }
         result.spiral_vase_enable = enable;
-        // If we're going to apply spiralvase to this layer, disable loop clipping.
-        m_enable_loop_clipping = !enable;
+        // Legacy vase layers contain one loop. With islands, only the explicitly
+        // selected primary bypasses clipping in extrude_loop().
+        m_enable_loop_clipping = !enable || m_config.spiral_mode_allow_islands;
     }
+
+    if (!result.spiral_vase_enable)
+        m_spiral_vase_primary_polygon.points.clear();
 
     std::string gcode;
     assert(is_decimal_separator_point()); // for the sprintfs
@@ -6145,7 +6150,9 @@ LayerResult GCode::process_layer(
         // sequential printing, and the explicit AsObjectList order, which tour whole instances.
         const bool island_level_ordering = print.config().print_sequence != PrintSequence::ByObject &&
             single_object_instance_idx == size_t(-1) &&
-            print.config().print_order != PrintOrder::AsObjectList;
+            print.config().print_order != PrintOrder::AsObjectList &&
+            // Select and emit the primary loop before touring the other islands.
+            !(result.spiral_vase_enable && m_config.spiral_mode_allow_islands);
         // A mixed-color slot is absent from layer_tools.extruders by design: resolve_mixed_filaments()
         // replaced it with its physical components. Its geometry is still keyed under the slot in
         // by_extruder though, and the sublayer emitter looks the plan up by slot id, so append the
@@ -6544,6 +6551,61 @@ LayerResult GCode::process_layer(
                 // in this instance's frame after set_origin() above). Empty islands are skipped;
                 // the trailing catch-all island has no centroid to chain by and always goes last.
                 std::vector<ObjectByExtruder::Island> &islands = instance_to_print.object_by_extruder.islands;
+                if (result.spiral_vase_enable && m_config.spiral_mode_allow_islands && m_spiral_vase_primary_loop == nullptr) {
+                    // Select after grouping/flattening, where pointers identify the exact
+                    // entities the emitter consumes. Arachne width/overhang segments stay
+                    // inside their owning loop; open fragments and hole loops cannot win.
+                    size_t primary_region = 0;
+                    const ExtrusionEntitiesPtr* primary_perimeters = nullptr;
+                    double best_overlap = 0.;
+                    double best_area = 0.;
+                    for (const auto& island : islands) {
+                        for (size_t region_idx = 0; region_idx < island.by_region.size(); ++region_idx) {
+                            const auto& perimeters = island.by_region[region_idx].perimeters;
+                            for (const ExtrusionEntity* entity : perimeters) {
+                                const auto* loop = dynamic_cast<const ExtrusionLoop*>(entity);
+                                if (loop == nullptr || loop->paths.empty() || loop->paths.back().size() < 2 ||
+                                    loop->inset_idx > 0 || (loop->loop_role() & elrHole) != 0)
+                                    continue;
+                                Point3 endpoint = loop->paths.back().last_point3();
+                                bool continuous = true;
+                                for (const ExtrusionPath& path : loop->paths) {
+                                    if (path.size() < 2 || path.first_point3() != endpoint ||
+                                        path.is_force_no_extrusion() || !is_perimeter(path.role())) {
+                                        continuous = false;
+                                        break;
+                                    }
+                                    endpoint = path.last_point3();
+                                }
+                                if (!continuous)
+                                    continue;
+                                const Polygon polygon = loop->polygon();
+                                const double area = std::abs(polygon.area());
+                                double overlap = 0.;
+                                if (!m_spiral_vase_primary_polygon.empty())
+                                    for (const Polygon& part : intersection(Polygons{polygon}, Polygons{m_spiral_vase_primary_polygon}))
+                                        overlap += part.area();
+                                if (overlap > best_overlap || (overlap == best_overlap && area > best_area)) {
+                                    m_spiral_vase_primary_loop = loop;
+                                    primary_region = region_idx;
+                                    primary_perimeters = &perimeters;
+                                    best_overlap = overlap;
+                                    best_area = area;
+                                }
+                            }
+                        }
+                    }
+                    if (m_spiral_vase_primary_loop != nullptr) {
+                        m_config.apply(print.get_print_region(primary_region).config());
+                        const Point* start_point = best_overlap > 0. ? &m_spiral_vase_primary_point : nullptr;
+                        gcode += this->extrude_loop(*m_spiral_vase_primary_loop, "perimeter", -1., *primary_perimeters, start_point);
+                        m_spiral_vase_primary_polygon = m_spiral_vase_primary_loop->polygon();
+                    } else {
+                        // No closed contour can form a helix on this layer. Keep all
+                        // normal paths, and restart continuity when one returns.
+                        m_spiral_vase_primary_polygon.points.clear();
+                    }
+                }
                 std::vector<size_t> island_order = visit.islands;
                 if (island_order.empty()) {
                     island_order.reserve(islands.size());
@@ -7300,10 +7362,12 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     // if polyline was shorter than the clipping distance we'd get a null polyline, so
     // we discard it in that case
     const double seam_gap = scale_(m_config.seam_gap.get_abs_value(nozzle_diameter));
-    const bool seam_gap_applied = enable_seam_slope || m_enable_loop_clipping;
+    const bool primary_spiral = &loop_ref == m_spiral_vase_primary_loop;
+    const bool enable_loop_clipping = m_enable_loop_clipping && !primary_spiral;
+    const bool seam_gap_applied = enable_seam_slope || enable_loop_clipping;
     const double seam_gap_distance_mm = seam_gap_applied ? unscale_(seam_gap) : 0.0;
     double seam_scarf_distance_mm = 0.0;
-    const double clip_length = m_enable_loop_clipping && !enable_seam_slope ? seam_gap : 0;
+    const double clip_length = enable_loop_clipping && !enable_seam_slope ? seam_gap : 0;
 
     // get paths
     ExtrusionPaths paths;
@@ -7327,7 +7391,7 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     // If region perimeters size not greater than or equal to 2, then skip the wipe inside move as we will extrude in mid air
     // as no neighbouring perimeter exists. If an internal perimeter exists, we should find 2 perimeters touching the de-retraction point
     // 1 - the currently printed external perimeter and 2 - the neighbouring internal perimeter.
-    if (m_config.wipe_before_external_loop.value && !paths.empty() && paths.front().size() > 1 && paths.back().size() > 1 && paths.front().role() == erExternalPerimeter && region_perimeters.size() > 1) {
+    if (!primary_spiral && m_config.wipe_before_external_loop.value && !paths.empty() && paths.front().size() > 1 && paths.back().size() > 1 && paths.front().role() == erExternalPerimeter && region_perimeters.size() > 1) {
         const bool is_full_loop_ccw = loop.polygon().is_counter_clockwise();
         bool is_hole_loop = (loop.loop_role() & ExtrusionLoopRole::elrHole) != 0;
         const double nozzle_diam = nozzle_diameter;
@@ -7420,6 +7484,13 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
         m_multi_flow_segment_path_average_mm3_per_mm = weighted_sum_mm3_per_mm / total_multipath_length;
     // Orca: end of multipath average mm3_per_mm value calculation
     
+    if (primary_spiral) {
+        char marker[128];
+        const double top_z = m_layer->print_z + m_config.z_offset.value;
+        snprintf(marker, sizeof(marker), "%s %.6f %.6f\n", SpiralVase::primary_begin,
+                 top_z - m_layer->height, top_z);
+        gcode += marker;
+    }
     if (!enable_seam_slope) {
         for (const ExtrusionPath& path : paths) {
             gcode += this->_extrude(path, description, speed_for_path(path));
@@ -7474,6 +7545,11 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
             paths.insert(paths.end(), new_loop.paths.begin(), new_loop.paths.end());
             paths.insert(paths.end(), new_loop.ends.begin(), new_loop.ends.end());
         }
+    }
+
+    if (primary_spiral) {
+        m_spiral_vase_primary_point = this->last_pos();
+        gcode += std::string(SpiralVase::primary_end) + "\n";
     }
 
     if (description == "perimeter") {
@@ -7676,6 +7752,8 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                         wipe_support->append(*ee);
 
             for (const ExtrusionEntity* ee : region.perimeters) {
+                if (ee == m_spiral_vase_primary_loop)
+                    continue;
                 if (defer_unsupported && waits_for_infill(ee) != unsupported_loops_only)
                     continue;
                 gcode += this->extrude_entity(*ee, "perimeter", -1., region.perimeters,
